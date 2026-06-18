@@ -29,12 +29,52 @@ async fn test_api_draw_success() {
 
     let body: DrawResponse = resp.json();
     assert_eq!(body.total_participants, 4);
+    assert_eq!(body.unique_participants, 4);
     assert_eq!(body.winner_count, 2);
     assert_eq!(body.winners.len(), 2);
 
     for winner in &body.winners {
         assert!(req.participants.contains(winner));
     }
+}
+
+#[tokio::test]
+async fn test_api_draw_with_duplicate_participants() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let req = json!({
+        "participants": ["alice", "bob", "alice", "charlie", "bob", "david"],
+        "count": 3,
+        "seed": 12345
+    });
+
+    let resp = server.post("/api/draw").json(&req).await;
+
+    resp.assert_status(StatusCode::OK);
+
+    let body: DrawResponse = resp.json();
+    assert_eq!(body.total_participants, 6);
+    assert_eq!(body.unique_participants, 4);
+    assert_eq!(body.winner_count, 3);
+    assert_eq!(body.winners.len(), 3);
+
+    let mut winners_sorted = body.winners.clone();
+    winners_sorted.sort();
+    winners_sorted.dedup();
+    assert_eq!(winners_sorted.len(), 3, "中奖者列表不能有重复");
+}
+
+#[tokio::test]
+async fn test_api_draw_count_exceeds_unique() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let req = json!({
+        "participants": ["user1", "user2", "user1", "user2", "user1"],
+        "count": 3
+    });
+
+    let resp = server.post("/api/draw").json(&req).await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

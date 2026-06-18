@@ -4,6 +4,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -25,6 +26,9 @@ pub struct DrawResponse {
 
     #[schema(example = 5)]
     pub total_participants: usize,
+
+    #[schema(example = 5)]
+    pub unique_participants: usize,
 
     #[schema(example = 2)]
     pub winner_count: usize,
@@ -48,7 +52,9 @@ pub struct DrawQuery {
 pub async fn draw(
     Json(req): Json<DrawRequest>,
 ) -> Result<Json<DrawResponse>, AppError> {
-    if req.participants.is_empty() {
+    let total_participants = req.participants.len();
+
+    if total_participants == 0 {
         return Err(AppError::BadRequest("参与者列表不能为空".into()));
     }
 
@@ -56,11 +62,19 @@ pub async fn draw(
         return Err(AppError::BadRequest("中奖数量必须大于 0".into()));
     }
 
-    if req.count > req.participants.len() {
+    let unique_participants: Vec<String> = req
+        .participants
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let unique_count = unique_participants.len();
+
+    if req.count > unique_count {
         return Err(AppError::BadRequest(format!(
-            "中奖数量 ({}) 不能大于参与者数量 ({})",
-            req.count,
-            req.participants.len()
+            "中奖数量 ({}) 不能大于去重后参与者数量 ({})",
+            req.count, unique_count
         )));
     }
 
@@ -69,13 +83,14 @@ pub async fn draw(
         None => ChaCha20Rng::from_entropy(),
     };
 
-    let mut participants = req.participants.clone();
+    let mut participants = unique_participants;
     participants.shuffle(&mut rng);
 
     let winners: Vec<String> = participants.into_iter().take(req.count).collect();
 
     Ok(Json(DrawResponse {
-        total_participants: req.participants.len(),
+        total_participants,
+        unique_participants: unique_count,
         winner_count: winners.len(),
         winners,
     }))
@@ -98,8 +113,89 @@ mod tests {
 
         let resp = result.unwrap().0;
         assert_eq!(resp.total_participants, 3);
+        assert_eq!(resp.unique_participants, 3);
         assert_eq!(resp.winner_count, 2);
         assert_eq!(resp.winners.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_draw_duplicate_participants_deduped() {
+        let req = DrawRequest {
+            participants: vec![
+                "alice".into(),
+                "bob".into(),
+                "alice".into(),
+                "charlie".into(),
+                "bob".into(),
+            ],
+            count: 2,
+            seed: Some(42),
+        };
+
+        let result = draw(Json(req)).await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap().0;
+        assert_eq!(resp.total_participants, 5);
+        assert_eq!(resp.unique_participants, 3);
+        assert_eq!(resp.winner_count, 2);
+        assert_eq!(resp.winners.len(), 2);
+
+        let mut winners = resp.winners.clone();
+        winners.sort();
+        winners.dedup();
+        assert_eq!(winners.len(), 2, "中奖者不能有重复");
+    }
+
+    #[tokio::test]
+    async fn test_draw_all_duplicates_only_one_unique() {
+        let req = DrawRequest {
+            participants: vec!["same".into(), "same".into(), "same".into()],
+            count: 1,
+            seed: None,
+        };
+
+        let result = draw(Json(req)).await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap().0;
+        assert_eq!(resp.total_participants, 3);
+        assert_eq!(resp.unique_participants, 1);
+        assert_eq!(resp.winner_count, 1);
+        assert_eq!(resp.winners, vec!["same"]);
+    }
+
+    #[tokio::test]
+    async fn test_draw_count_exceeds_unique_participants() {
+        let req = DrawRequest {
+            participants: vec!["a".into(), "b".into(), "a".into(), "b".into()],
+            count: 3,
+            seed: None,
+        };
+
+        let result = draw(Json(req)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_draw_winners_all_unique() {
+        let participants: Vec<String> = (1..=100).map(|i| format!("user{}", i)).collect();
+        let mut all_participants = participants.clone();
+        all_participants.extend(participants.iter().take(20).cloned());
+
+        let req = DrawRequest {
+            participants: all_participants,
+            count: 50,
+            seed: Some(999),
+        };
+
+        let resp = draw(Json(req)).await.unwrap().0;
+
+        let mut winners_sorted = resp.winners.clone();
+        winners_sorted.sort();
+        winners_sorted.dedup();
+        assert_eq!(winners_sorted.len(), resp.winners.len(), "中奖列表中不能有重复用户");
+        assert_eq!(resp.unique_participants, 100);
     }
 
     #[tokio::test]
