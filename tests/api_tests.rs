@@ -1,13 +1,21 @@
 use axum::http::StatusCode;
 use axum::Router;
 use axum_test::TestServer;
+use lottery_api::export::ExportResponse;
 use lottery_api::lottery::{DrawRequest, DrawResponse};
 use serde_json::json;
 
 fn make_app() -> Router {
-    use axum::routing::post;
+    use axum::routing::{get, post};
+    use lottery_api::export::{draw_and_export, download_file};
     use lottery_api::lottery::draw;
-    Router::new().route("/api/draw", post(draw))
+
+    let _ = lottery_api::export::init_export_dir();
+
+    Router::new()
+        .route("/api/draw", post(draw))
+        .route("/api/draw/export", post(draw_and_export))
+        .route("/api/download/:filename", get(download_file))
 }
 
 #[tokio::test]
@@ -194,4 +202,116 @@ async fn test_api_draw_all_participants_win() {
     let mut winners = body.winners;
     winners.sort();
     assert_eq!(winners, vec!["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn test_api_draw_and_export_success() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let req = json!({
+        "participants": ["alice", "bob", "charlie", "david", "eve"],
+        "count": 3,
+        "seed": 12345
+    });
+
+    let resp = server.post("/api/draw/export").json(&req).await;
+
+    resp.assert_status(StatusCode::OK);
+
+    let body: ExportResponse = resp.json();
+    assert!(body.filename.ends_with(".xlsx"));
+    assert!(body.download_url.starts_with("/api/download/"));
+    assert!(body.full_url.contains("localhost"));
+    assert_eq!(body.draw_result.total_participants, 5);
+    assert_eq!(body.draw_result.winner_count, 3);
+
+    let export_dir = std::env::current_dir().unwrap().join("exports");
+    let filepath = export_dir.join(&body.filename);
+    assert!(filepath.exists(), "导出的 Excel 文件不存在");
+
+    let metadata = std::fs::metadata(&filepath).unwrap();
+    assert!(metadata.len() > 1000, "Excel 文件太小");
+
+    let _ = std::fs::remove_file(&filepath);
+}
+
+#[tokio::test]
+async fn test_api_download_file_success() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let export_req = json!({
+        "participants": ["user1", "user2", "user3"],
+        "count": 2,
+        "seed": 999
+    });
+
+    let export_resp = server.post("/api/draw/export").json(&export_req).await;
+    let export_body: ExportResponse = export_resp.json();
+    let filename = export_body.filename.clone();
+
+    let download_resp = server.get(&format!("/api/download/{}", filename)).await;
+    download_resp.assert_status(StatusCode::OK);
+
+    let content_type = download_resp.header("content-type");
+    assert!(content_type.contains("vnd.openxmlformats"));
+
+    let disposition = download_resp.header("content-disposition");
+    assert!(disposition.contains("attachment"));
+    assert!(disposition.contains(&filename));
+
+    let export_dir = std::env::current_dir().unwrap().join("exports");
+    let filepath = export_dir.join(&filename);
+    let _ = std::fs::remove_file(&filepath);
+}
+
+#[tokio::test]
+async fn test_api_download_file_not_found() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let resp = server.get("/api/download/nonexistent_file.xlsx").await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_download_file_path_traversal() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let resp = server.get("/api/download/../../../etc/passwd.xlsx").await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_download_file_wrong_extension() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let resp = server.get("/api/download/malicious.exe").await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_draw_and_export_with_duplicates() {
+    let server = TestServer::new(make_app()).unwrap();
+
+    let req = json!({
+        "participants": ["alice", "bob", "alice", "charlie", "bob", "david", "alice"],
+        "count": 3,
+        "seed": 42
+    });
+
+    let resp = server.post("/api/draw/export").json(&req).await;
+    resp.assert_status(StatusCode::OK);
+
+    let body: ExportResponse = resp.json();
+    assert_eq!(body.draw_result.total_participants, 7);
+    assert_eq!(body.draw_result.unique_participants, 4);
+    assert_eq!(body.draw_result.winner_count, 3);
+
+    let mut winners = body.draw_result.winners.clone();
+    winners.sort();
+    winners.dedup();
+    assert_eq!(winners.len(), 3);
+
+    let export_dir = std::env::current_dir().unwrap().join("exports");
+    let filepath = export_dir.join(&body.filename);
+    let _ = std::fs::remove_file(&filepath);
 }
